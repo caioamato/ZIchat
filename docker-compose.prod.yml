@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile.prod
     container_name: zitask-backend
     ports:
-      - "${BACKEND_PORT:-8089}:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
