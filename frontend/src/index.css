@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light dark;
+}
+
+@layer components {
+  .field-label {
+    @apply block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1.5;
+  }
+  .field-input {
+    @apply w-full bg-slate-50 dark:bg-dark-700 border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-zitask-secondary transition-colors;
+  }
+}
+
+@keyframes slide-in-from-right-4 {
+  from { opacity: 0; transform: translateX(1rem); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-in { animation: slide-in-from-right-4 0.2s ease-out; }

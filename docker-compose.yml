@@ -1,0 +1,55 @@
+services:
+  backend:
+    build: ./backend
+    container_name: zitask-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - zitask-network
+
+  frontend:
+    build: ./frontend
+    container_name: zitask-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - zitask-network
+
+  db:
+    image: postgres:15-alpine
+    container_name: zitask-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-zitask_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-zitask_pass}
+      POSTGRES_DB: ${DB_NAME:-zitask_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - zitask-db-data:/var/lib/postgresql/data
+    networks:
+      - zitask-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: zitask-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - zitask-network
+
+networks:
+  zitask-network:
+    driver: bridge
+
+volumes:
+  zitask-db-data:
