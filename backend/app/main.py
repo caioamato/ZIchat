@@ -9,7 +9,10 @@ from typing import Optional, List
 from pydantic import BaseModel, Field, field_validator
 from urllib.parse import urlparse
 from datetime import datetime
-import secrets, json, httpx, os
+import secrets, json, httpx, os, ssl
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from .database import engine, Base, SessionLocal, get_db
 from .models import models
 from .auth import (
@@ -788,6 +791,80 @@ async def change_password(
     current_user.password_hash = hash_password(new_password)
     db.commit()
     return {"message": "Senha alterada com sucesso"}
+
+
+# ── Reset de senha por email ─────────────────────────────────────────────────
+
+async def _send_reset_email(to_email: str, to_name: str, new_password: str):
+    smtp_host = os.getenv("SMTP_HOST", "smtp.hostinger.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "ZItask — Sua nova senha"
+    msg["From"]    = f"ZItask <{smtp_from}>"
+    msg["To"]      = to_email
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#f8fafc;border-radius:16px;">
+      <h2 style="color:#122B3C;margin-bottom:4px;">ZI<span style="color:#43B7BF">task</span></h2>
+      <p style="color:#64748b;font-size:13px;margin-top:0;">Gestão de Atividades</p>
+      <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0;">
+      <p style="color:#1e293b;font-size:15px;">Olá, <strong>{to_name}</strong>!</p>
+      <p style="color:#475569;font-size:14px;">Recebemos uma solicitação de redefinição de senha para sua conta.</p>
+      <p style="color:#475569;font-size:14px;">Sua nova senha temporária é:</p>
+      <div style="background:#122B3C;border-radius:10px;padding:16px 24px;text-align:center;margin:24px 0;">
+        <span style="color:#43B7BF;font-size:22px;font-weight:900;letter-spacing:2px;font-family:monospace;">{new_password}</span>
+      </div>
+      <p style="color:#475569;font-size:13px;">Acesse o sistema e troque sua senha em <strong>Configurações → Alterar senha</strong>.</p>
+      <p style="color:#94a3b8;font-size:12px;margin-top:32px;">Se você não solicitou isso, ignore este email. Sua senha anterior continua funcionando.</p>
+    </div>
+    """
+
+    msg.attach(MIMEText(html, "html"))
+
+    ctx = ssl.create_default_context()
+    await aiosmtplib.send(
+        msg,
+        hostname=smtp_host,
+        port=smtp_port,
+        username=smtp_user,
+        password=smtp_pass,
+        tls_context=ctx,
+        use_tls=True,
+    )
+
+
+@app.post("/auth/forgot-password")
+@limiter.limit("5/minute")
+async def forgot_password(request: Request, data: dict, db: Session = Depends(get_db)):
+    email = (data.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Informe o email")
+
+    user = db.query(models.User).filter(
+        models.User.email == email,
+        models.User.is_active == True,
+    ).first()
+
+    # Sempre retorna sucesso para não revelar se o email existe
+    if not user:
+        return {"message": "Se o email estiver cadastrado, você receberá a nova senha em instantes."}
+
+    new_password = secrets.token_urlsafe(10)
+    user.password_hash = hash_password(new_password)
+    db.commit()
+
+    try:
+        await _send_reset_email(user.email, user.name, new_password)
+    except Exception as e:
+        # Reverte a senha se o email falhou
+        db.refresh(user)
+        raise HTTPException(status_code=502, detail=f"Erro ao enviar email: {str(e)}")
+
+    return {"message": "Se o email estiver cadastrado, você receberá a nova senha em instantes."}
 
 
 @app.delete("/tasks/{task_id}")
