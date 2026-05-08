@@ -123,9 +123,6 @@ export default function LoginPage({ onLogin }) {
           </form>
         </div>
 
-        <p className="text-center text-xs text-white/30 mt-5">
-          Primeiro acesso? Use <span className="font-mono font-semibold text-white/50">admin@zitask.com</span> / <span className="font-mono font-semibold text-white/50">admin123</span>
-        </p>
       </div>
     </div>
   )

@@ -9,8 +9,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
     networks:
       - zitask-network
 
@@ -22,6 +24,8 @@ services:
     volumes:
       - ./frontend:/app
       - /app/node_modules
+    environment:
+      - VITE_API_URL=https://api.zitask.cloud
     networks:
       - zitask-network
 
@@ -32,18 +36,19 @@ services:
       POSTGRES_USER: ${DB_USER:-zitask_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-zitask_pass}
       POSTGRES_DB: ${DB_NAME:-zitask_db}
-    ports:
-      - "5432:5432"
     volumes:
       - zitask-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-zitask_user} -d ${DB_NAME:-zitask_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - zitask-network
 
   redis:
     image: redis:7-alpine
     container_name: zitask-redis
-    ports:
-      - "6379:6379"
     networks:
       - zitask-network
 

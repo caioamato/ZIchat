@@ -1,11 +1,15 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from typing import Optional
-from pydantic import BaseModel
+from typing import Optional, List
+from pydantic import BaseModel, Field, field_validator
+from urllib.parse import urlparse
 from datetime import datetime
-import json, httpx
+import secrets, json, httpx, os
 from .database import engine, Base, SessionLocal, get_db
 from .models import models
 from .auth import (
@@ -15,14 +19,18 @@ from .auth import (
 
 models.Base.metadata.create_all(bind=engine)
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="ZItask API", version="0.3.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 _STATUS_MAP   = {s.value.upper(): s for s in models.TaskStatus}
@@ -47,8 +55,9 @@ def on_startup():
     db = SessionLocal()
     try:
         # Adiciona novos valores ao enum categorytag se ainda não existirem
-        new_categories = ["Administrativo", "Contabilidade", "Digital"]
-        for val in new_categories:
+        # DDL do PostgreSQL não aceita parâmetros bind — usamos allowlist para validar antes de interpolar
+        _CATEGORY_ALLOWLIST = {"Administrativo", "Contabilidade", "Digital"}
+        for val in _CATEGORY_ALLOWLIST:
             try:
                 db.execute(text(f"ALTER TYPE categorytag ADD VALUE IF NOT EXISTS '{val}'"))
                 db.commit()
@@ -150,16 +159,18 @@ def on_startup():
             models.User.role == models.UserRole.ADMIN_MASTER
         ).first()
         if not exists:
+            _admin_pass = os.getenv("ADMIN_PASSWORD") or secrets.token_urlsafe(12)
             admin = models.User(
                 name="Administrador",
                 email="admin@zitask.com",
-                password_hash=hash_password("admin123"),
+                password_hash=hash_password(_admin_pass),
                 role=models.UserRole.ADMIN_MASTER,
                 is_active=True,
             )
             db.add(admin)
             db.commit()
-            print("✅ Admin padrão criado: admin@zitask.com / admin123")
+            print(f"✅ Admin padrão criado: admin@zitask.com / {_admin_pass}")
+            print("⚠️  Anote a senha acima e altere no primeiro acesso.")
 
         # Garante workspace e projeto padrão (necessário para FK de tasks)
         if not db.query(models.Workspace).first():
@@ -209,41 +220,60 @@ class GroupAddMember(BaseModel):
     user_id: int
 
 
+def _validate_url(v: Optional[str]) -> Optional[str]:
+    if not v or not v.strip():
+        return None
+    parsed = urlparse(v.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("action_link deve ser uma URL http ou https válida")
+    return v.strip()
+
+
 class TaskCreate(BaseModel):
-    title: str
-    description: Optional[str] = None
+    title: str = Field(..., max_length=500)
+    description: Optional[str] = Field(None, max_length=10000)
     status: Optional[str] = "To Do"
     priority: Optional[str] = "Medium"
-    category: Optional[str] = "Geral"
+    category: Optional[str] = Field("Geral", max_length=100)
     due_date: Optional[str] = None
-    assigned_to: Optional[str] = None
-    color: Optional[str] = None
-    tags: Optional[list] = []
-    assignees: Optional[list] = []
+    assigned_to: Optional[str] = Field(None, max_length=200)
+    color: Optional[str] = Field(None, max_length=20)
+    tags: Optional[List[str]] = Field(default=[], max_length=50)
+    assignees: Optional[List[dict]] = Field(default=[], max_length=50)
     project_id: Optional[int] = 1
-    dod_checklist: Optional[list] = []
-    attachments: Optional[list] = []
-    blocking_dependencies: Optional[list] = []
-    action_link: Optional[str] = None
-    systems: Optional[list] = []
+    dod_checklist: Optional[List[dict]] = Field(default=[], max_length=100)
+    attachments: Optional[List[dict]] = Field(default=[], max_length=20)
+    blocking_dependencies: Optional[List] = Field(default=[], max_length=50)
+    action_link: Optional[str] = Field(None, max_length=2000)
+    systems: Optional[List] = Field(default=[], max_length=50)
+
+    @field_validator("action_link", mode="before")
+    @classmethod
+    def validate_action_link(cls, v):
+        return _validate_url(v)
 
 
 class TaskUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=500)
+    description: Optional[str] = Field(None, max_length=10000)
     status: Optional[str] = None
     priority: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[str] = Field(None, max_length=100)
     due_date: Optional[str] = None
-    assigned_to: Optional[str] = None
-    color: Optional[str] = None
-    tags: Optional[list] = None
-    assignees: Optional[list] = None
-    dod_checklist: Optional[list] = None
-    attachments: Optional[list] = None
-    blocking_dependencies: Optional[list] = None
-    action_link: Optional[str] = None
-    systems: Optional[list] = None
+    assigned_to: Optional[str] = Field(None, max_length=200)
+    color: Optional[str] = Field(None, max_length=20)
+    tags: Optional[List[str]] = Field(None, max_length=50)
+    assignees: Optional[List[dict]] = Field(None, max_length=50)
+    dod_checklist: Optional[List[dict]] = Field(None, max_length=100)
+    attachments: Optional[List[dict]] = Field(None, max_length=20)
+    blocking_dependencies: Optional[List] = Field(None, max_length=50)
+    action_link: Optional[str] = Field(None, max_length=2000)
+    systems: Optional[List] = Field(None, max_length=50)
+
+    @field_validator("action_link", mode="before")
+    @classmethod
+    def validate_action_link(cls, v):
+        return _validate_url(v)
 
 
 # ── Auth endpoints ───────────────────────────────────────────────────────────
@@ -254,7 +284,8 @@ async def health_check():
 
 
 @app.post("/auth/login")
-async def login(data: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, data: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(
         models.User.email == data.email.lower().strip()
     ).first()
@@ -620,11 +651,16 @@ async def get_tasks(
 async def get_task(
     task_id: int,
     db: Session = Depends(get_db),
-    _user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(get_current_user),
 ):
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+    if current_user.role != models.UserRole.ADMIN_MASTER:
+        is_owner    = task.created_by == current_user.id
+        is_assignee = any(a.get("id") == current_user.id for a in (task.assignees or []) if isinstance(a, dict))
+        if not is_owner and not is_assignee:
+            raise HTTPException(status_code=403, detail="Sem permissão para acessar esta atividade")
     return task
 
 
@@ -784,8 +820,8 @@ class AIConfig(BaseModel):
     prompt_title: Optional[str] = None
 
 class AIImproveRequest(BaseModel):
-    text: str
-    mode: Optional[str] = "description"  # description | title
+    text: str = Field(..., max_length=5000)
+    mode: Optional[str] = Field("description", pattern="^(description|title)$")
 
 def _get_setting(db: Session, key: str) -> Optional[str]:
     row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
@@ -857,46 +893,57 @@ async def improve_text(
     provider = cfg.get("provider")
     api_key  = cfg.get("api_key")
     model    = cfg.get("model")
-    text     = data.text.strip()
-    if not text:
+    user_text = data.text.strip()
+    if not user_text:
         raise HTTPException(status_code=400, detail="Texto vazio.")
 
     if data.mode == "title":
         system_prompt = cfg.get("prompt_title") or DEFAULT_AI_PROMPT_TITLE
     else:
         system_prompt = cfg.get("prompt") or DEFAULT_AI_PROMPT
-    prompt = f"{system_prompt}{text}"
+
+    # Allowlists de modelos por provider — evita SSRF/injeção via model name
+    _GEMINI_MODELS  = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"}
+    _CLAUDE_MODELS  = {"claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-7"}
+    _OPENAI_MODELS  = {"gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"}
 
     try:
         if provider == "gemini":
-            mdl = model or "gemini-2.5-flash"
+            mdl = model if model in _GEMINI_MODELS else "gemini-2.5-flash"
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     f"https://generativelanguage.googleapis.com/v1/models/{mdl}:generateContent?key={api_key}",
-                    json={"contents": [{"parts": [{"text": prompt}]}]}
+                    json={
+                        "system_instruction": {"parts": [{"text": system_prompt}]},
+                        "contents": [{"parts": [{"text": user_text}]}],
+                    }
                 )
                 resp.raise_for_status()
                 result = resp.json()
                 improved = result["candidates"][0]["content"]["parts"][0]["text"]
 
         elif provider == "claude":
-            mdl = model or "claude-haiku-4-5-20251001"
+            mdl = model if model in _CLAUDE_MODELS else "claude-haiku-4-5-20251001"
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": mdl, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+                    json={"model": mdl, "max_tokens": 1024, "system": system_prompt,
+                          "messages": [{"role": "user", "content": user_text}]}
                 )
                 resp.raise_for_status()
                 improved = resp.json()["content"][0]["text"]
 
         elif provider == "openai":
-            mdl = model or "gpt-4o-mini"
+            mdl = model if model in _OPENAI_MODELS else "gpt-4o-mini"
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"model": mdl, "messages": [{"role": "user", "content": prompt}]}
+                    json={"model": mdl, "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ]}
                 )
                 resp.raise_for_status()
                 improved = resp.json()["choices"][0]["message"]["content"]

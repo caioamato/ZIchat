@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
-  Layout, Kanban, Settings, BarChart3, Plus, Search, Clock,
+  Layout, Kanban, Settings, Plus, Search, Clock,
   X, CheckCircle2, Circle, ArrowRight, AlertCircle, User,
   Calendar, Pencil, Trash2, Flag, ChevronDown, Save, RefreshCw,
   AlertTriangle, Users, LogOut, FileDown, Link2, ExternalLink, GripVertical,
@@ -1509,103 +1509,169 @@ function KanbanView({ tasks, loading, loadError, onRetry, onAddTask, onMoveTask,
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente }) {
-  const isAdmin = currentUser?.role === 'admin_master'
-  const canFilterUsers = isAdmin || isGerente
+function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente, onEditTask, onDeleteTask, toast, categories, onAddCategory, onDeleteCategory, systems, onAddSystem, onDeleteSystem }) {
+  const isAdmin    = currentUser?.role === 'admin_master'
+  const canSeeAll  = isAdmin || isGerente
 
-  // Admin: pode filtrar por usuário
-  const [filterUserId, setFilterUserId] = useState('')
-  const [userStats,    setUserStats]    = useState([])
-  const [loadingStats, setLoadingStats] = useState(false)
+  const [filterAssignee, setFilterAssignee] = useState('')
+  const [filterDateFrom, setDateFrom]       = useState('')
+  const [filterDateTo,   setDateTo]         = useState('')
+  const [filterPriority, setFilterPriority] = useState('')
+  const [filterStatus,   setFilterStatus]   = useState('')
+  const [sortBy,         setSortBy]         = useState('created_at')
+  const [editTask,       setEditTask]       = useState(null)
+  const [confirm,        setConfirm]        = useState(null)
+  const [userStats,      setUserStats]      = useState([])
+  const [loadingStats,   setLoadingStats]   = useState(false)
 
   useEffect(() => {
-    if (!canFilterUsers) return
+    if (!canSeeAll) return
     setLoadingStats(true)
     api.get('/users/stats')
       .then(r => setUserStats(r.data))
       .catch(() => {})
       .finally(() => setLoadingStats(false))
-  }, [canFilterUsers])
+  }, [canSeeAll])
 
-  // Tarefas exibidas dependem do filtro (admin/gerente) ou são as próprias
-  const displayTasks = canFilterUsers && filterUserId
-    ? tasks.filter(t =>
-        String(t.created_by) === filterUserId ||
-        (t.assignees || []).some(a => String(a.id) === filterUserId)
-      )
-    : tasks
+  const assigneeOptions = [...new Map(
+    tasks.flatMap(t => (t.assignees || []).map(a => [a.id, a]))
+  ).values()].sort((a, b) => a.name.localeCompare(b.name))
 
-  const total    = displayTasks.length
-  const done     = displayTasks.filter(t => t.status === 'Done').length
-  const doing    = displayTasks.filter(t => ['Doing', 'Peer Review', 'Testing'].includes(t.status)).length
-  const urgent   = displayTasks.filter(t => t.priority === 'Urgent' && t.status !== 'Done').length
-  const overdue  = displayTasks.filter(t => isOverdue(t.due_date) && t.status !== 'Done').length
-  const progress = total > 0 ? Math.round((done / total) * 100) : 0
+  const hasDateFilter = filterDateFrom || filterDateTo
+  const hasAnyFilter  = filterAssignee || filterDateFrom || filterDateTo || filterPriority
 
-  const selectedUserName = userStats.find(u => String(u.id) === filterUserId)?.name || ''
+  // Base filter: date + assignee + priority → cards + charts + table
+  const displayTasks = tasks.filter(t => {
+    if (hasDateFilter) {
+      const d = new Date(t.created_at)
+      if (filterDateFrom && d < new Date(filterDateFrom + 'T00:00:00')) return false
+      if (filterDateTo   && d > new Date(filterDateTo   + 'T23:59:59')) return false
+    }
+    if (filterAssignee && !(t.assignees || []).some(a => String(a.id) === filterAssignee)) return false
+    if (filterPriority && t.priority !== filterPriority) return false
+    return true
+  })
+
+  // Table also applies status filter + sort
+  const sorted = [...displayTasks]
+    .filter(t => !filterStatus || t.status === filterStatus)
+    .sort((a, b) => {
+      if (sortBy === 'created_at') return new Date(b.created_at) - new Date(a.created_at)
+      if (sortBy === 'priority') {
+        const o = { Urgent: 0, High: 1, Medium: 2, Low: 3 }
+        return (o[a.priority] ?? 2) - (o[b.priority] ?? 2)
+      }
+      if (sortBy === 'title')    return a.title.localeCompare(b.title)
+      if (sortBy === 'due_date') {
+        if (!a.due_date) return 1; if (!b.due_date) return -1
+        return new Date(a.due_date) - new Date(b.due_date)
+      }
+      return 0
+    })
+
+  const total   = displayTasks.length
+  const done    = displayTasks.filter(t => t.status === 'Done').length
+  const doing   = displayTasks.filter(t => ['Doing', 'Peer Review', 'Testing'].includes(t.status)).length
+  const urgent  = displayTasks.filter(t => t.priority === 'Urgent' && t.status !== 'Done').length
+  const overdue = displayTasks.filter(t => isOverdue(t.due_date) && t.status !== 'Done').length
+  const pct     = total > 0 ? Math.round((done / total) * 100) : 0
+
+  const selectedUserName = userStats.find(u => String(u.id) === filterAssignee)?.name || ''
 
   return (
     <div className="flex-1 overflow-y-auto p-7 bg-slate-50 dark:bg-dark-900/50">
-      <div className="flex items-start justify-between mb-1">
+
+      {/* Header */}
+      <div className="flex items-start justify-between mb-5">
         <div>
-          <h2 className="text-xl font-black text-yellow-500 mb-0.5">{(() => { const h = new Date().getHours(); return h >= 6 && h < 12 ? 'Bom dia!' : h >= 12 && h < 18 ? 'Boa Tarde!' : h >= 18 || h < 1 ? 'Boa Noite!' : 'Tá trabalhando agora?' })()}</h2>
+          <h2 className="text-xl font-black text-yellow-500 mb-0.5">
+            {(() => { const h = new Date().getHours(); return h >= 6 && h < 12 ? 'Bom dia!' : h >= 12 && h < 18 ? 'Boa Tarde!' : h >= 18 || h < 1 ? 'Boa Noite!' : 'Tá trabalhando agora?' })()}
+          </h2>
           <p className="text-sm text-slate-400">
-            {canFilterUsers
+            {canSeeAll
               ? selectedUserName ? `Atividades de ${selectedUserName}` : isAdmin ? 'Visão geral de todas as atividades' : 'Atividades do meu setor'
               : 'Minhas atividades'}
           </p>
         </div>
+        <button
+          onClick={() => generatePDF(sorted, columns, { from: filterDateFrom, to: filterDateTo })}
+          className="flex items-center gap-2 px-4 py-2 bg-zitask-secondary text-zitask-primary font-bold rounded-xl text-sm hover:bg-zitask-secondary/90 transition-colors shadow-md"
+        >
+          <FileDown className="w-4 h-4" />
+          Exportar PDF{sorted.length < tasks.length ? ` (${sorted.length})` : ''}
+        </button>
+      </div>
 
-        {/* Filtro por usuário — admin e gerente */}
-        {canFilterUsers && (
-          <div className="flex items-center gap-2">
-            <User className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
-            <select
-              value={filterUserId}
-              onChange={e => setFilterUserId(e.target.value)}
-              className="text-xs bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 focus:outline-none focus:border-zitask-secondary"
-            >
-              <option value="">{isAdmin ? 'Todos os usuários' : 'Todo o setor'}</option>
-              {userStats.map(u => (
-                <option key={u.id} value={String(u.id)}>{u.name}</option>
-              ))}
-            </select>
-          </div>
+      {/* Filter bar — shared by cards, charts and table */}
+      <div className="flex gap-2.5 mb-5 flex-wrap items-center">
+        {canSeeAll && (
+          <select value={filterAssignee} onChange={e => setFilterAssignee(e.target.value)}
+            className="text-xs bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 focus:outline-none focus:border-zitask-secondary">
+            <option value="">{isAdmin ? 'Todos os usuários' : 'Todo o setor'}</option>
+            {assigneeOptions.map(a => <option key={a.id} value={String(a.id)}>{a.name}</option>)}
+          </select>
+        )}
+
+        <select value={filterPriority} onChange={e => setFilterPriority(e.target.value)}
+          className="text-xs bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 focus:outline-none focus:border-zitask-secondary">
+          <option value="">Todas as prioridades</option>
+          <option value="Urgent">Urgente</option>
+          <option value="High">Alta</option>
+          <option value="Medium">Média</option>
+          <option value="Low">Baixa</option>
+        </select>
+
+        <div className="flex items-center gap-1.5 bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-1.5">
+          <Calendar className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+          <input type="date" value={filterDateFrom} onChange={e => setDateFrom(e.target.value)}
+            className="text-xs bg-transparent outline-none text-slate-600 dark:text-slate-300 w-28" />
+          <span className="text-xs text-slate-300 dark:text-slate-600">—</span>
+          <input type="date" value={filterDateTo} onChange={e => setDateTo(e.target.value)}
+            className="text-xs bg-transparent outline-none text-slate-600 dark:text-slate-300 w-28" />
+          {hasDateFilter && (
+            <button onClick={() => { setDateFrom(''); setDateTo('') }} className="text-slate-400 hover:text-red-400 transition-colors ml-1">
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+
+        {hasAnyFilter && (
+          <button
+            onClick={() => { setFilterAssignee(''); setFilterPriority(''); setDateFrom(''); setDateTo('') }}
+            className="text-xs text-slate-400 hover:text-red-400 transition-colors flex items-center gap-1"
+          >
+            <X className="w-3 h-3" /> Limpar
+          </button>
         )}
       </div>
 
-      <div className="mb-7 mt-6">
-        {/* Stat cards */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          {[
-            { label: 'Total de Atividades', value: total,  icon: <Circle className="w-5 h-5" />,      color: 'text-slate-400',        bg: 'bg-slate-100 dark:bg-slate-700/50'      },
-            { label: 'Em Andamento',        value: doing,  icon: <ArrowRight className="w-5 h-5" />,  color: 'text-zitask-secondary', bg: 'bg-zitask-secondary/10'                 },
-            { label: 'Urgentes',            value: urgent, icon: <Flag className="w-5 h-5" />,         color: 'text-red-500',          bg: 'bg-red-50 dark:bg-red-900/20'           },
-            { label: 'Atrasadas',           value: overdue,icon: <AlertCircle className="w-5 h-5" />, color: 'text-orange-500',       bg: 'bg-orange-50 dark:bg-orange-900/20'     },
-          ].map(c => (
-            <div key={c.label} className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
-              <div className={`w-9 h-9 rounded-xl flex items-center justify-center mb-3 ${c.bg} ${c.color}`}>{c.icon}</div>
-              <p className="text-3xl font-black mb-0.5">{c.value}</p>
-              <p className="text-xs text-slate-400 font-medium">{c.label}</p>
-            </div>
-          ))}
-        </div>
+      {/* Stat cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
+        {[
+          { label: hasDateFilter ? 'No Período' : 'Total',  value: total,   icon: <Circle className="w-5 h-5" />,        color: 'text-slate-400',        bg: 'bg-slate-100 dark:bg-slate-700/50'   },
+          { label: 'Concluídas',                             value: done,    icon: <CheckCircle2 className="w-5 h-5" />,  color: 'text-green-500',        bg: 'bg-green-50 dark:bg-green-900/20'    },
+          { label: 'Em Andamento',                           value: doing,   icon: <ArrowRight className="w-5 h-5" />,   color: 'text-zitask-secondary', bg: 'bg-zitask-secondary/10'              },
+          { label: 'Atrasadas',                              value: overdue, icon: <AlertCircle className="w-5 h-5" />,  color: 'text-red-500',          bg: 'bg-red-50 dark:bg-red-900/20'        },
+        ].map(c => (
+          <div key={c.label} className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
+            <div className={`w-9 h-9 rounded-xl flex items-center justify-center mb-3 ${c.bg} ${c.color}`}>{c.icon}</div>
+            <p className="text-3xl font-black mb-0.5">{c.value}</p>
+            <p className="text-xs text-slate-400 font-medium">{c.label}</p>
+          </div>
+        ))}
       </div>
 
       {/* Gamificação — sempre do usuário logado */}
       {(() => {
-        const currentTier  = getTier(myDoneTasks)
-        const nextTier     = TIERS.slice().reverse().find(t => myDoneTasks < t.min)
-        const prevMin      = currentTier ? currentTier.min : 0
-        const nextMin      = nextTier ? nextTier.min : (currentTier ? currentTier.min : 25)
-        const barMax       = nextTier ? nextTier.min : (currentTier ? currentTier.min : 25)
-        const barVal       = currentTier && !nextTier ? barMax : Math.min(myDoneTasks, barMax)
-        const pct          = Math.round((barVal / barMax) * 100)
-        const barColor     = nextTier ? nextTier.color : (currentTier ? currentTier.color : '#CD7F32')
+        const currentTier = getTier(myDoneTasks)
+        const nextTier    = TIERS.slice().reverse().find(t => myDoneTasks < t.min)
+        const barMax      = nextTier ? nextTier.min : (currentTier ? currentTier.min : 25)
+        const barVal      = currentTier && !nextTier ? barMax : Math.min(myDoneTasks, barMax)
+        const barPct      = Math.round((barVal / barMax) * 100)
+        const barColor    = nextTier ? nextTier.color : (currentTier ? currentTier.color : '#CD7F32')
         return (
-          <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm mb-7">
+          <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm mb-5">
             <div className="flex items-center gap-4">
-              {/* Medalha atual */}
               <div className="flex-shrink-0 text-center">
                 <div
                   className="w-14 h-14 rounded-2xl flex items-center justify-center text-3xl shadow-md"
@@ -1617,36 +1683,24 @@ function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente }) 
                   {currentTier ? currentTier.label.toUpperCase() : 'SEM TIER'}
                 </p>
               </div>
-
-              {/* Barra de progresso */}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between mb-1.5">
                   <p className="text-sm font-bold">
-                    {currentTier && !nextTier
-                      ? 'Nível máximo atingido!'
-                      : nextTier
-                        ? `Próximo: ${nextTier.emoji} ${nextTier.label}`
-                        : 'Conquiste o Bronze'}
+                    {currentTier && !nextTier ? 'Nível máximo atingido!' : nextTier ? `Próximo: ${nextTier.emoji} ${nextTier.label}` : 'Conquiste o Bronze'}
                   </p>
                   <span className="text-xs font-black" style={{ color: barColor }}>
                     {myDoneTasks}{nextTier ? `/${nextTier.min}` : ''}
                   </span>
                 </div>
                 <div className="w-full bg-slate-100 dark:bg-dark-700 rounded-full h-3.5 overflow-hidden">
-                  <div
-                    className="h-3.5 rounded-full transition-all duration-700"
-                    style={{ width: `${pct}%`, background: `linear-gradient(90deg, ${barColor}99, ${barColor})`, boxShadow: `0 0 8px ${barColor}66` }}
-                  />
+                  <div className="h-3.5 rounded-full transition-all duration-700"
+                    style={{ width: `${barPct}%`, background: `linear-gradient(90deg, ${barColor}99, ${barColor})`, boxShadow: `0 0 8px ${barColor}66` }} />
                 </div>
                 <div className="flex justify-between mt-1.5">
                   <p className="text-[10px] text-slate-400">{myDoneTasks} tarefas concluídas</p>
-                  {nextTier && (
-                    <p className="text-[10px] text-slate-400">{nextTier.min - myDoneTasks} para o próximo nível</p>
-                  )}
+                  {nextTier && <p className="text-[10px] text-slate-400">{nextTier.min - myDoneTasks} para o próximo nível</p>}
                 </div>
               </div>
-
-              {/* Próximas medalhas */}
               <div className="hidden sm:flex flex-col gap-1.5 flex-shrink-0">
                 {TIERS.slice().reverse().map(t => (
                   <div key={t.name} className="flex items-center gap-1.5">
@@ -1660,20 +1714,49 @@ function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente }) 
         )
       })()}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-        {/* Progress */}
+      {/* Taxa de conclusão + Distribuição por etapa */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
         <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
-          <div className="flex justify-between mb-3">
-            <h3 className="font-bold text-sm">{isAdmin && selectedUserName ? `Progresso — ${selectedUserName}` : 'Meu Progresso'}</h3>
-            <span className="font-black text-sm text-zitask-secondary">{progress}%</span>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold text-sm">Taxa de conclusão{hasDateFilter ? ' do período' : ''}</h3>
+            <span className="text-xl font-black text-zitask-secondary">{pct}%</span>
           </div>
-          <div className="w-full bg-slate-100 dark:bg-dark-700 rounded-full h-3 mb-2">
-            <div className="bg-zitask-secondary h-3 rounded-full transition-all duration-500" style={{ width: `${progress}%` }} />
+          <div className="w-full bg-slate-100 dark:bg-dark-700 rounded-full h-3 overflow-hidden mb-2">
+            <div className="h-3 rounded-full transition-all duration-700"
+              style={{ width: `${pct}%`, background: 'linear-gradient(90deg, #43B7BF99, #43B7BF)' }} />
           </div>
-          <p className="text-xs text-slate-400">{done} de {total} concluídas</p>
+          <p className="text-xs text-slate-400">{done} de {total} atividades concluídas</p>
+          {overdue > 0 && <p className="text-xs text-red-400 font-medium mt-1">{overdue} atividade{overdue !== 1 ? 's' : ''} em atraso</p>}
         </div>
 
-        {/* By priority */}
+        <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
+          <h3 className="font-bold text-sm mb-4">Distribuição por etapa</h3>
+          {total === 0 ? (
+            <p className="text-xs text-slate-400 text-center py-4">Nenhuma atividade no período</p>
+          ) : (
+            <div className="flex items-end gap-1.5 h-24">
+              {columns.map(col => {
+                const count  = displayTasks.filter(t => t.status === col.id).length
+                const barPct = total > 0 ? (count / total) * 100 : 0
+                return (
+                  <div key={col.id} className="flex-1 flex flex-col items-center gap-1 h-full justify-end">
+                    <span className="text-[9px] font-black text-slate-500">{count > 0 ? count : ''}</span>
+                    <div className="w-full rounded-t-md transition-all duration-700 min-h-[2px]"
+                      style={{ height: `${Math.max(barPct, count > 0 ? 4 : 0)}%`, backgroundColor: col.color, opacity: count > 0 ? 1 : 0.15 }}
+                      title={`${col.label}: ${count}`} />
+                    <span className="text-[8px] text-slate-400 text-center leading-tight truncate w-full" title={col.label}>
+                      {col.label.length > 5 ? col.label.slice(0, 5) + '.' : col.label}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Por Prioridade + Por Coluna */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
         <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
           <h3 className="font-bold text-sm mb-4">Por Prioridade</h3>
           <div className="space-y-3">
@@ -1692,31 +1775,30 @@ function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente }) 
             })}
           </div>
         </div>
-      </div>
 
-      {/* By column */}
-      <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm mb-4">
-        <h3 className="font-bold text-sm mb-4">Por Coluna</h3>
-        <div className="space-y-3">
-          {columns.map(col => {
-            const count = displayTasks.filter(t => t.status === col.id).length
-            return (
-              <div key={col.id} className="flex items-center gap-3">
-                <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: col.color }} />
-                <span className="text-xs font-medium w-28">{col.label}</span>
-                <div className="flex-1 bg-slate-100 dark:bg-dark-700 rounded-full h-1.5">
-                  <div className="h-1.5 rounded-full transition-all" style={{ width: total > 0 ? `${(count / total) * 100}%` : '0%', backgroundColor: col.color }} />
+        <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
+          <h3 className="font-bold text-sm mb-4">Por Coluna</h3>
+          <div className="space-y-3">
+            {columns.map(col => {
+              const count = displayTasks.filter(t => t.status === col.id).length
+              return (
+                <div key={col.id} className="flex items-center gap-3">
+                  <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: col.color }} />
+                  <span className="text-xs font-medium w-28">{col.label}</span>
+                  <div className="flex-1 bg-slate-100 dark:bg-dark-700 rounded-full h-1.5">
+                    <div className="h-1.5 rounded-full transition-all" style={{ width: total > 0 ? `${(count / total) * 100}%` : '0%', backgroundColor: col.color }} />
+                  </div>
+                  <span className="text-xs font-bold w-4 text-right text-slate-500">{count}</span>
                 </div>
-                <span className="text-xs font-bold w-4 text-right text-slate-500">{count}</span>
-              </div>
-            )
-          })}
+              )
+            })}
+          </div>
         </div>
       </div>
 
-      {/* Desempenho por usuário — apenas admin */}
-      {canFilterUsers && (
-        <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm">
+      {/* Desempenho por Usuário — admin e gerente */}
+      {canSeeAll && (
+        <div className="bg-white dark:bg-dark-800 rounded-2xl p-5 border border-slate-200 dark:border-slate-700 shadow-sm mb-5">
           <h3 className="font-bold text-sm mb-4">Desempenho por Usuário</h3>
           {loadingStats ? (
             <div className="flex justify-center py-6">
@@ -1731,82 +1813,27 @@ function DashboardView({ tasks, currentUser, columns, myDoneTasks, isGerente }) 
                   <div
                     className="w-7 h-7 rounded-lg flex items-center justify-center font-bold text-[10px] text-white flex-shrink-0 cursor-pointer hover:ring-2 hover:ring-zitask-secondary transition-all"
                     style={{ background: 'linear-gradient(135deg, #43B7BF, #122B3C)' }}
-                    onClick={() => setFilterUserId(v => v === String(u.id) ? '' : String(u.id))}
+                    onClick={() => setFilterAssignee(v => v === String(u.id) ? '' : String(u.id))}
                     title={`Filtrar por ${u.name}`}
                   >
                     {initials(u.name)}
                   </div>
                   <span className="text-xs font-semibold w-28 truncate flex-shrink-0">{u.name}</span>
                   <div className="flex-1 bg-slate-100 dark:bg-dark-700 rounded-full h-2">
-                    <div
-                      className="h-2 rounded-full transition-all duration-500"
-                      style={{ width: `${u.pct}%`, backgroundColor: '#43B7BF' }}
-                    />
+                    <div className="h-2 rounded-full transition-all duration-500" style={{ width: `${u.pct}%`, backgroundColor: '#43B7BF' }} />
                   </div>
                   <span className="text-xs font-black text-zitask-secondary w-9 text-right flex-shrink-0">{u.pct}%</span>
                   <span className="text-[10px] text-slate-400 w-14 text-right flex-shrink-0">{u.done}/{u.total} ok</span>
-                  {u.overdue > 0 && (
-                    <span className="text-[10px] text-red-400 font-bold flex-shrink-0">{u.overdue} atr.</span>
-                  )}
+                  {u.overdue > 0 && <span className="text-[10px] text-red-400 font-bold flex-shrink-0">{u.overdue} atr.</span>}
                 </div>
               ))}
             </div>
           )}
         </div>
       )}
-    </div>
-  )
-}
 
-// ─── Analytics View ───────────────────────────────────────────────────────────
-
-function AnalyticsView({ tasks, onEditTask, onDeleteTask, toast, categories, onAddCategory, onDeleteCategory, systems, onAddSystem, onDeleteSystem, columns, currentUser }) {
-  const [sortBy,        setSortBy]       = useState('created_at')
-  const [filterStatus,  setFilterStatus] = useState('')
-  const [filterDateFrom,setDateFrom]     = useState('')
-  const [filterDateTo,  setDateTo]       = useState('')
-  const [editTask,      setEditTask]     = useState(null)
-  const [confirm,       setConfirm]      = useState(null)
-
-  const sorted = [...tasks]
-    .filter(t => !filterStatus || t.status === filterStatus)
-    .filter(t => {
-      if (!filterDateFrom && !filterDateTo) return true
-      const d = new Date(t.created_at)
-      if (filterDateFrom && d < new Date(filterDateFrom + 'T00:00:00')) return false
-      if (filterDateTo   && d > new Date(filterDateTo   + 'T23:59:59')) return false
-      return true
-    })
-    .sort((a, b) => {
-      if (sortBy === 'created_at') return new Date(b.created_at) - new Date(a.created_at)
-      if (sortBy === 'priority') {
-        const o = { Urgent: 0, High: 1, Medium: 2, Low: 3 }
-        return (o[a.priority] ?? 2) - (o[b.priority] ?? 2)
-      }
-      if (sortBy === 'title')    return a.title.localeCompare(b.title)
-      if (sortBy === 'due_date') {
-        if (!a.due_date) return 1; if (!b.due_date) return -1
-        return new Date(a.due_date) - new Date(b.due_date)
-      }
-      return 0
-    })
-
-  const hasDateFilter = filterDateFrom || filterDateTo
-
-  return (
-    <div className="flex-1 overflow-y-auto p-7 bg-slate-50 dark:bg-dark-900/50">
-      <div className="flex items-start justify-between mb-6">
-        <h2 className="text-2xl font-bold text-slate-700 dark:text-slate-200">Histórico e métricas</h2>
-        <button
-          onClick={() => generatePDF(sorted, columns, { from: filterDateFrom, to: filterDateTo })}
-          className="flex items-center gap-2 px-4 py-2 bg-zitask-secondary text-zitask-primary font-bold rounded-xl text-sm hover:bg-zitask-secondary/90 transition-colors shadow-md"
-        >
-          <FileDown className="w-4 h-4" />
-          Exportar PDF {sorted.length < tasks.length && `(${sorted.length})`}
-        </button>
-      </div>
-
-      <div className="flex gap-3 mb-4 flex-wrap items-center">
+      {/* Tabela de atividades */}
+      <div className="flex gap-2.5 mb-4 flex-wrap items-center">
         <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
           className="text-xs bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 focus:outline-none focus:border-zitask-secondary">
           <option value="">Todos os status</option>
@@ -1819,89 +1846,68 @@ function AnalyticsView({ tasks, onEditTask, onDeleteTask, toast, categories, onA
           <option value="title">Título A–Z</option>
           <option value="due_date">Prazo</option>
         </select>
-
-        {/* Filtro de período */}
-        <div className="flex items-center gap-1.5 bg-white dark:bg-dark-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-1.5">
-          <Calendar className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
-          <input
-            type="date"
-            value={filterDateFrom}
-            onChange={e => setDateFrom(e.target.value)}
-            className="text-xs bg-transparent outline-none text-slate-600 dark:text-slate-300 w-28"
-          />
-          <span className="text-xs text-slate-300 dark:text-slate-600">—</span>
-          <input
-            type="date"
-            value={filterDateTo}
-            onChange={e => setDateTo(e.target.value)}
-            className="text-xs bg-transparent outline-none text-slate-600 dark:text-slate-300 w-28"
-          />
-          {hasDateFilter && (
-            <button onClick={() => { setDateFrom(''); setDateTo('') }} className="text-slate-400 hover:text-red-400 transition-colors ml-1">
-              <X className="w-3 h-3" />
-            </button>
-          )}
-        </div>
-
-        <span className="text-xs text-slate-400">{sorted.length} resultado{sorted.length !== 1 ? 's' : ''}</span>
+        {filterStatus && (
+          <button onClick={() => setFilterStatus('')} className="text-xs text-slate-400 hover:text-red-400 transition-colors flex items-center gap-1">
+            <X className="w-3 h-3" /> Limpar status
+          </button>
+        )}
+        <span className="text-xs text-slate-400 ml-auto">{sorted.length} resultado{sorted.length !== 1 ? 's' : ''}</span>
       </div>
 
       <div className="bg-white dark:bg-dark-800 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[700px]">
-          <thead>
-            <tr className="text-[10px] uppercase tracking-widest text-slate-400 bg-slate-50 dark:bg-dark-700/50 border-b border-slate-100 dark:border-slate-700">
-              {['ID', 'Título', 'Status', 'Prioridade', 'Categoria', 'Responsável', 'Prazo', ''].map(h => (
-                <th key={h} className="text-left px-4 py-3 font-bold">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map(task => {
-              const pri = priorityInfo(task.priority)
-              const od  = isOverdue(task.due_date) && task.status !== 'Done'
-              return (
-                <tr key={task.id} className="border-b border-slate-50 dark:border-slate-700/30 hover:bg-slate-50 dark:hover:bg-dark-700/30 transition-colors group">
-                  <td className="px-4 py-3 font-black text-[10px] text-zitask-secondary">{task.task_id}</td>
-                  <td className="px-4 py-3 font-medium max-w-xs">
-                    <span className="truncate block">{task.title}</span>
-                    {task.tags?.length > 0 && (
-                      <div className="flex gap-1 mt-0.5">
-                        {task.tags.slice(0, 2).map(t => (
-                          <span key={t} className="text-[9px] text-slate-400">#{t}</span>
-                        ))}
+          <table className="w-full text-sm min-w-[700px]">
+            <thead>
+              <tr className="text-[10px] uppercase tracking-widest text-slate-400 bg-slate-50 dark:bg-dark-700/50 border-b border-slate-100 dark:border-slate-700">
+                {['ID', 'Título', 'Status', 'Prioridade', 'Categoria', 'Responsável', 'Prazo', ''].map(h => (
+                  <th key={h} className="text-left px-4 py-3 font-bold">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(task => {
+                const pri = priorityInfo(task.priority)
+                const od  = isOverdue(task.due_date) && task.status !== 'Done'
+                return (
+                  <tr key={task.id} className="border-b border-slate-50 dark:border-slate-700/30 hover:bg-slate-50 dark:hover:bg-dark-700/30 transition-colors group">
+                    <td className="px-4 py-3 font-black text-[10px] text-zitask-secondary">{task.task_id}</td>
+                    <td className="px-4 py-3 font-medium max-w-xs">
+                      <span className="truncate block">{task.title}</span>
+                      {task.tags?.length > 0 && (
+                        <div className="flex gap-1 mt-0.5">
+                          {task.tags.slice(0, 2).map(t => <span key={t} className="text-[9px] text-slate-400">#{t}</span>)}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="px-2 py-0.5 bg-slate-100 dark:bg-dark-700 rounded-full text-[10px] font-bold">{colLabel(task.status, columns)}</span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`flex items-center gap-1 text-[10px] font-bold w-fit ${pri.color}`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${pri.dot}`} />
+                        {pri.label}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-[10px] text-slate-400">{task.category || '—'}</td>
+                    <td className="px-4 py-3 text-[10px] text-slate-400">{assigneeNames(task)}</td>
+                    <td className={`px-4 py-3 text-[10px] font-medium ${od ? 'text-red-500' : 'text-slate-400'}`}>
+                      {task.due_date ? formatDate(task.due_date) : '—'}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                        <button onClick={() => setEditTask(task)} className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-dark-700 text-slate-400 hover:text-zitask-secondary transition-colors">
+                          <Pencil className="w-3 h-3" />
+                        </button>
+                        <button onClick={() => setConfirm(task)} className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-slate-400 hover:text-red-500 transition-colors">
+                          <Trash2 className="w-3 h-3" />
+                        </button>
                       </div>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-0.5 bg-slate-100 dark:bg-dark-700 rounded-full text-[10px] font-bold">{colLabel(task.status, columns)}</span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className={`flex items-center gap-1 text-[10px] font-bold w-fit ${pri.color}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${pri.dot}`} />
-                      {pri.label}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-[10px] text-slate-400">{task.category || '—'}</td>
-                  <td className="px-4 py-3 text-[10px] text-slate-400">{assigneeNames(task)}</td>
-                  <td className={`px-4 py-3 text-[10px] font-medium ${od ? 'text-red-500' : 'text-slate-400'}`}>
-                    {task.due_date ? formatDate(task.due_date) : '—'}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                      <button onClick={() => setEditTask(task)} className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-dark-700 text-slate-400 hover:text-zitask-secondary transition-colors">
-                        <Pencil className="w-3 h-3" />
-                      </button>
-                      <button onClick={() => setConfirm(task)} className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-slate-400 hover:text-red-500 transition-colors">
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
         </div>
         {sorted.length === 0 && (
           <p className="text-center text-slate-400 py-12 text-sm">Nenhuma atividade encontrada.</p>
@@ -1909,7 +1915,10 @@ function AnalyticsView({ tasks, onEditTask, onDeleteTask, toast, categories, onA
       </div>
 
       {editTask && (
-        <TaskModal task={editTask} toast={toast} onClose={() => setEditTask(null)} onSave={onEditTask} onDelete={onDeleteTask} categories={categories} onAddCategory={onAddCategory} onDeleteCategory={onDeleteCategory} systems={systems} onAddSystem={onAddSystem} onDeleteSystem={onDeleteSystem} columns={columns} currentUser={currentUser} />
+        <TaskModal task={editTask} toast={toast} onClose={() => setEditTask(null)} onSave={onEditTask} onDelete={onDeleteTask}
+          categories={categories} onAddCategory={onAddCategory} onDeleteCategory={onDeleteCategory}
+          systems={systems} onAddSystem={onAddSystem} onDeleteSystem={onDeleteSystem}
+          columns={columns} currentUser={currentUser} />
       )}
       {confirm && (
         <ConfirmDialog
@@ -2192,7 +2201,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem('zitask_user')) } catch { return null }
   })
-  const [activeView,  setActiveView]  = useState(() => localStorage.getItem('zitask_view') || 'dashboard')
+  const [activeView,  setActiveView]  = useState(() => { const v = localStorage.getItem('zitask_view'); return (v && v !== 'analytics') ? v : 'dashboard' })
   const [tasks,       setTasks]       = useState([])
   const [loading,     setLoading]     = useState(true)
   const [loadError,   setLoadError]   = useState(false)
@@ -2331,6 +2340,20 @@ export default function App() {
     window.location.reload()
   }
 
+  // Valida token e atualiza user com dados do servidor — impede que role seja falsificado via localStorage
+  useEffect(() => {
+    const token = localStorage.getItem('zitask_token')
+    if (!token) return
+    api.get('/auth/me').then(r => {
+      setCurrentUser(r.data)
+      localStorage.setItem('zitask_user', JSON.stringify(r.data))
+    }).catch(() => {
+      localStorage.removeItem('zitask_token')
+      localStorage.removeItem('zitask_user')
+      window.location.reload()
+    })
+  }, [])
+
   useEffect(() => {
     if (!currentUser) return
     fetchTasks()
@@ -2419,11 +2442,10 @@ export default function App() {
   }
 
   const NAV = [
-    { id: 'dashboard', label: 'Dashboard',     Icon: Layout    },
-    { id: 'kanban',    label: 'Board Kanban',   Icon: Kanban    },
-    { id: 'analytics', label: 'Analytics',      Icon: BarChart3 },
+    { id: 'dashboard', label: 'Dashboard',    Icon: Layout    },
+    { id: 'kanban',    label: 'Atividades',    Icon: Kanban    },
     ...(isAdmin ? [{ id: 'users', label: 'Usuários', Icon: Users }] : []),
-    { id: 'settings',  label: 'Configurações',  Icon: Settings  },
+    { id: 'settings',  label: 'Configurações', Icon: Settings  },
   ]
 
   const workspaceName = isConvidado
@@ -2544,7 +2566,24 @@ export default function App() {
           </div>
         </header>
 
-        {activeView === 'dashboard' && <DashboardView tasks={tasks} currentUser={currentUser} columns={columns} myDoneTasks={myDoneTasks} isGerente={isGerente} />}
+        {activeView === 'dashboard' && (
+          <DashboardView
+            tasks={tasks}
+            currentUser={currentUser}
+            columns={columns}
+            myDoneTasks={myDoneTasks}
+            isGerente={isGerente}
+            onEditTask={handleEditTask}
+            onDeleteTask={handleDeleteTask}
+            toast={toast}
+            categories={categories}
+            onAddCategory={handleAddCategory}
+            onDeleteCategory={handleDeleteCategory}
+            systems={systems}
+            onAddSystem={handleAddSystem}
+            onDeleteSystem={handleDeleteSystem}
+          />
+        )}
         {activeView === 'kanban'    && (
           <KanbanView
             tasks={tasks}
@@ -2570,10 +2609,7 @@ export default function App() {
             onReorderColumns={handleReorderColumns}
           />
         )}
-        {activeView === 'analytics' && (
-          <AnalyticsView tasks={tasks} onEditTask={handleEditTask} onDeleteTask={handleDeleteTask} toast={toast} categories={categories} onAddCategory={handleAddCategory} onDeleteCategory={handleDeleteCategory} systems={systems} onAddSystem={handleAddSystem} onDeleteSystem={handleDeleteSystem} columns={columns} currentUser={currentUser} />
-        )}
-        {activeView === 'users'     && isAdmin && (
+{activeView === 'users'     && isAdmin && (
           <UsersView currentUser={currentUser} toast={toast} />
         )}
         {activeView === 'settings'  && <SettingsView isDarkMode={isDarkMode} setIsDarkMode={setIsDarkMode} toast={toast} isAdmin={isAdmin} />}

@@ -1,6 +1,6 @@
 from jose import JWTError, jwt
 import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -8,9 +8,11 @@ import os
 from .database import get_db
 from .models import models
 
-SECRET_KEY = os.getenv("SECRET_KEY", "zitask-dev-secret-change-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY não definida. Configure a variável de ambiente antes de iniciar.")
 ALGORITHM = "HS256"
-TOKEN_EXPIRE_DAYS = 7
+TOKEN_EXPIRE_HOURS = 24
 
 security = HTTPBearer()
 
@@ -27,7 +29,7 @@ def create_token(user_id: int, role: str) -> str:
     payload = {
         "sub": str(user_id),
         "role": role,
-        "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS),
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
