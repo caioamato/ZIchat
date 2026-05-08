@@ -5,6 +5,7 @@ from sqlalchemy import text
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
+import json, httpx
 from .database import engine, Base, SessionLocal, get_db
 from .models import models
 from .auth import (
@@ -26,7 +27,6 @@ app.add_middleware(
 
 _STATUS_MAP   = {s.value.upper(): s for s in models.TaskStatus}
 _PRIORITY_MAP = {p.value.upper(): p for p in models.Priority}
-_CATEGORY_MAP = {c.value.upper(): c for c in models.CategoryTag}
 
 
 # ── Startup: garante que existe ao menos um admin ────────────────────────────
@@ -62,6 +62,89 @@ def on_startup():
         except Exception:
             db.rollback()
 
+        # Migra category de enum para varchar (permite categorias customizadas)
+        try:
+            db.execute(text("ALTER TABLE tasks ALTER COLUMN category DROP DEFAULT"))
+            db.execute(text("ALTER TABLE tasks ALTER COLUMN category TYPE VARCHAR USING category::text"))
+            db.execute(text("ALTER TABLE tasks ALTER COLUMN category SET DEFAULT 'Geral'"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Adiciona coluna created_by se não existir
+        try:
+            db.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_by INTEGER REFERENCES users(id)"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Adiciona coluna action_link se não existir
+        try:
+            db.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS action_link VARCHAR"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Adiciona coluna systems se não existir
+        try:
+            db.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS systems JSONB DEFAULT '[]'::jsonb"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Adiciona valor CONVIDADO ao enum userrole (uppercase, consistente com ADMIN_MASTER/COLABORADOR)
+        try:
+            # Corrige migração anterior que adicionou 'convidado' minúsculo
+            db.execute(text("""
+                UPDATE pg_enum SET enumlabel = 'CONVIDADO'
+                WHERE enumtypid = 'userrole'::regtype AND enumlabel = 'convidado'
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            db.execute(text("ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'CONVIDADO'"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Adiciona valor GERENTE ao enum userrole
+        try:
+            db.execute(text("ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'GERENTE'"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Cria tabela app_settings
+        try:
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key VARCHAR PRIMARY KEY,
+                    value TEXT
+                )
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Cria tabela groups e adiciona group_id em users
+        try:
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR NOT NULL UNIQUE,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         # Garante admin padrão
         exists = db.query(models.User).filter(
             models.User.role == models.UserRole.ADMIN_MASTER
@@ -77,6 +160,17 @@ def on_startup():
             db.add(admin)
             db.commit()
             print("✅ Admin padrão criado: admin@zitask.com / admin123")
+
+        # Garante workspace e projeto padrão (necessário para FK de tasks)
+        if not db.query(models.Workspace).first():
+            ws = models.Workspace(name="Principal", description="Workspace padrão")
+            db.add(ws)
+            db.commit()
+            db.refresh(ws)
+            proj = models.Project(name="Geral", workspace_id=ws.id)
+            db.add(proj)
+            db.commit()
+            print("✅ Workspace e projeto padrão criados")
     finally:
         db.close()
 
@@ -103,6 +197,18 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
 
 
+class GroupCreate(BaseModel):
+    name: str
+
+
+class GroupRename(BaseModel):
+    name: str
+
+
+class GroupAddMember(BaseModel):
+    user_id: int
+
+
 class TaskCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -118,6 +224,8 @@ class TaskCreate(BaseModel):
     dod_checklist: Optional[list] = []
     attachments: Optional[list] = []
     blocking_dependencies: Optional[list] = []
+    action_link: Optional[str] = None
+    systems: Optional[list] = []
 
 
 class TaskUpdate(BaseModel):
@@ -134,6 +242,8 @@ class TaskUpdate(BaseModel):
     dod_checklist: Optional[list] = None
     attachments: Optional[list] = None
     blocking_dependencies: Optional[list] = None
+    action_link: Optional[str] = None
+    systems: Optional[list] = None
 
 
 # ── Auth endpoints ───────────────────────────────────────────────────────────
@@ -153,24 +263,34 @@ async def login(data: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Usuário inativo. Contate o administrador.")
     token = create_token(user.id, user.role.value)
+    ws    = db.query(models.Workspace).first()
+    group = db.query(models.Group).filter(models.Group.id == user.group_id).first() if user.group_id else None
     return {
         "token": token,
         "user": {
-            "id": user.id,
-            "name": user.name,
-            "email": user.email,
-            "role": user.role.value,
+            "id":             user.id,
+            "name":           user.name,
+            "email":          user.email,
+            "role":           user.role.value,
+            "group_id":       user.group_id,
+            "group_name":     group.name if group else None,
+            "workspace_name": ws.name if ws else "ZItask",
         },
     }
 
 
 @app.get("/auth/me")
-async def me(current_user: models.User = Depends(get_current_user)):
+async def me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ws = db.query(models.Workspace).first()
+    group = db.query(models.Group).filter(models.Group.id == current_user.group_id).first() if current_user.group_id else None
     return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "role": current_user.role.value,
+        "id":             current_user.id,
+        "name":           current_user.name,
+        "email":          current_user.email,
+        "role":           current_user.role.value,
+        "group_id":       current_user.group_id,
+        "group_name":     group.name if group else None,
+        "workspace_name": ws.name if ws else "ZItask",
     }
 
 
@@ -182,7 +302,7 @@ async def list_members(
     members = db.query(models.User).filter(
         models.User.is_active == True
     ).order_by(models.User.name).all()
-    return [{"id": u.id, "name": u.name, "email": u.email} for u in members]
+    return [{"id": u.id, "name": u.name, "email": u.email, "group_id": u.group_id} for u in members]
 
 
 # ── User management (admin only) ─────────────────────────────────────────────
@@ -193,14 +313,17 @@ async def list_users(
     _admin: models.User = Depends(require_admin),
 ):
     users = db.query(models.User).order_by(models.User.created_at).all()
+    groups = {g.id: g.name for g in db.query(models.Group).all()}
     return [
         {
-            "id": u.id,
-            "name": u.name,
-            "email": u.email,
-            "role": u.role.value,
-            "is_active": u.is_active,
+            "id":         u.id,
+            "name":       u.name,
+            "email":      u.email,
+            "role":       u.role.value,
+            "is_active":  u.is_active,
             "created_at": u.created_at,
+            "group_id":   u.group_id,
+            "group_name": groups.get(u.group_id),
         }
         for u in users
     ]
@@ -282,6 +405,147 @@ async def delete_user(
     return {"message": "Usuário excluído com sucesso"}
 
 
+# ── Groups (admin only) ──────────────────────────────────────────────────────
+
+def _group_out(g: models.Group):
+    return {
+        "id":      g.id,
+        "name":    g.name,
+        "members": [{"id": u.id, "name": u.name, "email": u.email} for u in g.members],
+    }
+
+
+@app.get("/groups")
+async def list_groups(db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    return [_group_out(g) for g in db.query(models.Group).order_by(models.Group.name).all()]
+
+
+@app.post("/groups", status_code=201)
+async def create_group(data: GroupCreate, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nome não pode ser vazio")
+    if db.query(models.Group).filter(models.Group.name == name).first():
+        raise HTTPException(status_code=409, detail="Já existe um grupo com este nome")
+    g = models.Group(name=name)
+    db.add(g)
+    db.commit()
+    db.refresh(g)
+    return _group_out(g)
+
+
+@app.patch("/groups/{group_id}")
+async def rename_group(group_id: int, data: GroupRename, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    g = db.query(models.Group).filter(models.Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nome não pode ser vazio")
+    conflict = db.query(models.Group).filter(models.Group.name == name, models.Group.id != group_id).first()
+    if conflict:
+        raise HTTPException(status_code=409, detail="Já existe um grupo com este nome")
+    g.name = name
+    db.commit()
+    db.refresh(g)
+    return _group_out(g)
+
+
+@app.delete("/groups/{group_id}")
+async def delete_group(group_id: int, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    g = db.query(models.Group).filter(models.Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+    db.query(models.User).filter(models.User.group_id == group_id).update({"group_id": None})
+    db.delete(g)
+    db.commit()
+    return {"message": "Grupo excluído"}
+
+
+@app.post("/groups/{group_id}/members")
+async def add_group_member(group_id: int, data: GroupAddMember, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    g = db.query(models.Group).filter(models.Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+    u = db.query(models.User).filter(models.User.id == data.user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    u.group_id = group_id
+    db.commit()
+    db.refresh(g)
+    return _group_out(g)
+
+
+@app.delete("/groups/{group_id}/members/{user_id}")
+async def remove_group_member(group_id: int, user_id: int, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    g = db.query(models.Group).filter(models.Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+    u = db.query(models.User).filter(models.User.id == user_id, models.User.group_id == group_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuário não está neste grupo")
+    u.group_id = None
+    db.commit()
+    db.refresh(g)
+    return _group_out(g)
+
+
+@app.patch("/workspace")
+async def rename_workspace(data: GroupRename, db: Session = Depends(get_db), _admin: models.User = Depends(require_admin)):
+    ws = db.query(models.Workspace).first()
+    if not ws:
+        raise HTTPException(status_code=404, detail="Workspace não encontrado")
+    ws.name = data.name.strip() or ws.name
+    db.commit()
+    return {"workspace_name": ws.name}
+
+
+# ── User stats (admin only) ──────────────────────────────────────────────────
+
+@app.get("/users/stats")
+async def get_user_stats(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if current_user.role not in (models.UserRole.ADMIN_MASTER, models.UserRole.GERENTE):
+        raise HTTPException(status_code=403, detail="Acesso não autorizado")
+
+    if current_user.role == models.UserRole.GERENTE:
+        users = db.query(models.User).filter(
+            models.User.is_active == True,
+            models.User.group_id == current_user.group_id
+        ).all()
+    else:
+        users = db.query(models.User).filter(models.User.is_active == True).all()
+    all_tasks = db.query(models.Task).all()
+    now = datetime.utcnow()
+
+    result = []
+    for u in users:
+        user_tasks = [
+            t for t in all_tasks
+            if t.created_by == u.id or any(
+                a.get("id") == u.id for a in (t.assignees or []) if isinstance(a, dict)
+            )
+        ]
+        done    = sum(1 for t in user_tasks if t.status and t.status.value == "Done")
+        doing   = sum(1 for t in user_tasks if t.status and t.status.value in ("Doing", "Peer Review", "Testing"))
+        overdue = sum(1 for t in user_tasks if t.due_date and t.due_date.replace(tzinfo=None) < now and (not t.status or t.status.value != "Done"))
+        urgent  = sum(1 for t in user_tasks if t.priority and t.priority.value == "Urgent" and (not t.status or t.status.value != "Done"))
+        result.append({
+            "id":       u.id,
+            "name":     u.name,
+            "role":     u.role.value,
+            "total":    len(user_tasks),
+            "done":     done,
+            "doing":    doing,
+            "overdue":  overdue,
+            "urgent":   urgent,
+            "pct":      round((done / len(user_tasks)) * 100) if user_tasks else 0,
+        })
+    return result
+
+
 # ── Seed ─────────────────────────────────────────────────────────────────────
 
 @app.post("/seed")
@@ -323,9 +587,33 @@ async def seed_data(
 @app.get("/tasks")
 async def get_tasks(
     db: Session = Depends(get_db),
-    _user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(get_current_user),
 ):
-    return db.query(models.Task).all()
+    if current_user.role == models.UserRole.ADMIN_MASTER:
+        return db.query(models.Task).all()
+
+    # Gerente: vê todas as tarefas dos membros do seu grupo
+    if current_user.role == models.UserRole.GERENTE and current_user.group_id:
+        member_ids = {u.id for u in db.query(models.User).filter(
+            models.User.group_id == current_user.group_id,
+            models.User.is_active == True
+        ).all()}
+        return [
+            t for t in db.query(models.Task).all()
+            if t.created_by is None
+            or t.created_by in member_ids
+            or any(a.get("id") in member_ids for a in (t.assignees or []) if isinstance(a, dict))
+        ]
+
+    all_tasks = db.query(models.Task).all()
+    visible = []
+    for task in all_tasks:
+        is_creator = task.created_by == current_user.id
+        assignees = task.assignees or []
+        is_assignee = any(a.get("id") == current_user.id for a in assignees if isinstance(a, dict))
+        if is_creator or is_assignee:
+            visible.append(task)
+    return visible
 
 
 @app.get("/tasks/{task_id}")
@@ -344,7 +632,7 @@ async def get_task(
 async def create_task(
     task_data: TaskCreate,
     db: Session = Depends(get_db),
-    _user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(get_current_user),
 ):
     last_task = db.query(models.Task).order_by(models.Task.id.desc()).first()
     next_id = 1
@@ -367,16 +655,19 @@ async def create_task(
         description=task_data.description,
         status=_STATUS_MAP.get(task_data.status.upper(), models.TaskStatus.TODO),
         priority=_PRIORITY_MAP.get(task_data.priority.upper(), models.Priority.MEDIUM),
-        category=_CATEGORY_MAP.get(task_data.category.upper(), models.CategoryTag.GENERAL),
+        category=task_data.category or "Geral",
         due_date=due,
         assigned_to=task_data.assigned_to,
         color=task_data.color,
         tags=task_data.tags,
         assignees=task_data.assignees or [],
+        created_by=current_user.id,
         project_id=task_data.project_id,
         dod_checklist=task_data.dod_checklist,
         attachments=task_data.attachments,
         blocking_dependencies=task_data.blocking_dependencies,
+        action_link=task_data.action_link,
+        systems=task_data.systems or [],
     )
     db.add(new_task)
     db.commit()
@@ -389,18 +680,25 @@ async def update_task(
     task_id: int,
     task_data: TaskUpdate,
     db: Session = Depends(get_db),
-    _user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(get_current_user),
 ):
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+
+    if current_user.role != models.UserRole.ADMIN_MASTER:
+        assignees = task.assignees or []
+        is_assignee = any(a.get("id") == current_user.id for a in assignees if isinstance(a, dict))
+        is_owner = task.created_by == current_user.id or task.created_by is None
+        if not is_owner and not is_assignee:
+            raise HTTPException(status_code=403, detail="Sem permissão para editar esta atividade")
 
     if task_data.status is not None:
         task.status = _STATUS_MAP.get(task_data.status.upper(), task.status)
     if task_data.priority is not None:
         task.priority = _PRIORITY_MAP.get(task_data.priority.upper(), task.priority)
     if task_data.category is not None:
-        task.category = _CATEGORY_MAP.get(task_data.category.upper(), task.category)
+        task.category = task_data.category
     if task_data.title is not None:
         task.title = task_data.title
     if task_data.description is not None:
@@ -427,21 +725,188 @@ async def update_task(
         task.assignees = task_data.assignees
     if task_data.blocking_dependencies is not None:
         task.blocking_dependencies = task_data.blocking_dependencies
+    if task_data.action_link is not None:
+        task.action_link = task_data.action_link if task_data.action_link.strip() else None
+    if task_data.systems is not None:
+        task.systems = task_data.systems
 
     db.commit()
     db.refresh(task)
     return task
 
 
+@app.post("/auth/change-password")
+async def change_password(
+    data: dict,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    current_password = data.get("current_password", "")
+    new_password     = data.get("new_password", "")
+    if not current_password or not new_password:
+        raise HTTPException(status_code=400, detail="Informe a senha atual e a nova senha")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="A nova senha deve ter ao menos 6 caracteres")
+    if not verify_password(current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Senha atual incorreta")
+    current_user.password_hash = hash_password(new_password)
+    db.commit()
+    return {"message": "Senha alterada com sucesso"}
+
+
 @app.delete("/tasks/{task_id}")
 async def delete_task(
     task_id: int,
     db: Session = Depends(get_db),
-    _user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(get_current_user),
 ):
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+
+    if current_user.role != models.UserRole.ADMIN_MASTER:
+        is_owner = task.created_by == current_user.id or task.created_by is None
+        if not is_owner:
+            raise HTTPException(status_code=403, detail="Sem permissão para excluir esta atividade")
+
     db.delete(task)
     db.commit()
     return {"message": "Tarefa deletada com sucesso"}
+
+
+# ── AI Settings ──────────────────────────────────────────────────────────────
+
+class AIConfig(BaseModel):
+    provider: str   # gemini | claude | openai
+    api_key: str
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    prompt_title: Optional[str] = None
+
+class AIImproveRequest(BaseModel):
+    text: str
+    mode: Optional[str] = "description"  # description | title
+
+def _get_setting(db: Session, key: str) -> Optional[str]:
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+    return row.value if row else None
+
+def _set_setting(db: Session, key: str, value: str):
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+    if row:
+        row.value = value
+    else:
+        db.add(models.AppSetting(key=key, value=value))
+    db.commit()
+
+
+DEFAULT_AI_PROMPT = (
+    "Você é AzorpaIA, assistente especializado em revisão de textos corporativos em português brasileiro. "
+    "Revise e melhore o seguinte texto: corrija erros gramaticais, melhore a clareza e o estilo profissional, "
+    "mantendo o significado original. Retorne APENAS o texto revisado, sem comentários adicionais.\n\nTexto:\n"
+)
+DEFAULT_AI_PROMPT_TITLE = (
+    "Você é AzorpaIA. Melhore o título desta atividade: deixe claro, direto e profissional, em português brasileiro. "
+    "Retorne APENAS o título revisado, sem explicações adicionais.\n\nTítulo:\n"
+)
+
+@app.get("/settings/ai")
+async def get_ai_settings(
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(require_admin),
+):
+    raw = _get_setting(db, "ai_config")
+    if not raw:
+        return {"provider": None, "model": None, "has_key": False, "prompt": DEFAULT_AI_PROMPT, "prompt_title": DEFAULT_AI_PROMPT_TITLE}
+    cfg = json.loads(raw)
+    return {
+        "provider":     cfg.get("provider"),
+        "model":        cfg.get("model"),
+        "has_key":      bool(cfg.get("api_key")),
+        "prompt":       cfg.get("prompt") or DEFAULT_AI_PROMPT,
+        "prompt_title": cfg.get("prompt_title") or DEFAULT_AI_PROMPT_TITLE,
+    }
+
+
+@app.post("/settings/ai")
+async def save_ai_settings(
+    data: AIConfig,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(require_admin),
+):
+    _set_setting(db, "ai_config", json.dumps({
+        "provider":     data.provider,
+        "api_key":      data.api_key,
+        "model":        data.model,
+        "prompt":       data.prompt or DEFAULT_AI_PROMPT,
+        "prompt_title": data.prompt_title or DEFAULT_AI_PROMPT_TITLE,
+    }))
+    return {"message": "Configuração salva com sucesso"}
+
+
+@app.post("/ai/improve")
+async def improve_text(
+    data: AIImproveRequest,
+    db: Session = Depends(get_db),
+    _user: models.User = Depends(get_current_user),
+):
+    raw = _get_setting(db, "ai_config")
+    if not raw:
+        raise HTTPException(status_code=400, detail="IA não configurada. Solicite ao administrador.")
+    cfg = json.loads(raw)
+    provider = cfg.get("provider")
+    api_key  = cfg.get("api_key")
+    model    = cfg.get("model")
+    text     = data.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Texto vazio.")
+
+    if data.mode == "title":
+        system_prompt = cfg.get("prompt_title") or DEFAULT_AI_PROMPT_TITLE
+    else:
+        system_prompt = cfg.get("prompt") or DEFAULT_AI_PROMPT
+    prompt = f"{system_prompt}{text}"
+
+    try:
+        if provider == "gemini":
+            mdl = model or "gemini-2.5-flash"
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1/models/{mdl}:generateContent?key={api_key}",
+                    json={"contents": [{"parts": [{"text": prompt}]}]}
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                improved = result["candidates"][0]["content"]["parts"][0]["text"]
+
+        elif provider == "claude":
+            mdl = model or "claude-haiku-4-5-20251001"
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": mdl, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+                )
+                resp.raise_for_status()
+                improved = resp.json()["content"][0]["text"]
+
+        elif provider == "openai":
+            mdl = model or "gpt-4o-mini"
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"model": mdl, "messages": [{"role": "user", "content": prompt}]}
+                )
+                resp.raise_for_status()
+                improved = resp.json()["choices"][0]["message"]["content"]
+
+        else:
+            raise HTTPException(status_code=400, detail="Provedor de IA inválido.")
+
+        return {"improved": improved.strip()}
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Erro na API de IA ({e.response.status_code}): {e.response.text[:200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao contatar IA: {str(e)}")

@@ -9,3 +9,4 @@ python-dotenv
 redis
 python-jose[cryptography]
 bcrypt
+httpx
